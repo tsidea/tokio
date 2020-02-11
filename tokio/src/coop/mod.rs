@@ -1,7 +1,7 @@
 //! Opt-in yield points for improved cooperative scheduling.
 //!
-//! A single call to `poll` on a top-level task may potentially do a lot of work before it returns
-//! `Poll::Pending`. If a task runs for a long period of time without yielding back to the
+//! A single call to [`poll`] on a top-level task may potentially do a lot of work before it
+//! returns `Poll::Pending`. If a task runs for a long period of time without yielding back to the
 //! executor, it can starve other tasks waiting on that executor to execute them, or drive
 //! underlying resources. Since Rust does not have a runtime, it is difficult to forcibly preempt a
 //! long-running task. Instead, this module provides an opt-in mechanism for futures to collaborate
@@ -36,7 +36,12 @@
 //!
 //! Voluntary yield points should be placed _after_ at least some work has been done. If they are
 //! not, a future sufficiently deep in the task hierarchy may end up _never_ getting to run because
-//! of the number of yield points that inevitably appear before it is reached.
+//! of the number of yield points that inevitably appear before it is reached. In general, you will
+//! want yield points to only appear in "leaf" futures -- those that do not themselves poll other
+//! futures. By doing this, you avoid double-counting each iteration of the outer future against
+//! the cooperating budget.
+//!
+//!   [`poll`]: https://doc.rust-lang.org/std/future/trait.Future.html#tymethod.poll
 
 // NOTE: The doctests in this module are ignored since the whole module is (currently) private.
 
@@ -55,15 +60,19 @@ use std::task::{Context, Poll};
 #[allow(dead_code)]
 const BUDGET: usize = 128;
 
+/// Constant used to determine if budgeting has been disabled.
+#[allow(dead_code)]
+const UNCONSTRAINED: usize = usize::max_value();
+
 thread_local! {
-    static HITS: Cell<usize> = Cell::new(usize::max_value());
+    static HITS: Cell<usize> = Cell::new(UNCONSTRAINED);
 }
 
 /// Mark that the top-level task yielded, and that the budget should be reset.
 #[allow(dead_code)]
 pub(crate) fn executor_tick() {
     HITS.with(|hits| {
-        if hits.get() != usize::max_value() {
+        if hits.get() != UNCONSTRAINED {
             hits.set(BUDGET);
         }
     });
@@ -79,7 +88,7 @@ pub(crate) fn opt_in() {
 #[allow(dead_code)]
 pub(crate) fn opt_out() {
     HITS.with(|hits| {
-        hits.set(usize::max_value());
+        hits.set(UNCONSTRAINED);
     });
 }
 
@@ -166,10 +175,7 @@ pub(crate) fn opt_out() {
 /// inside the buget is the _minimum_ of the _current_ budget and the bound.
 ///
 #[allow(unreachable_pub, dead_code)]
-pub fn limit<F, R>(bound: usize, f: F) -> R
-where
-    F: FnOnce() -> R,
-{
+pub fn limit<R>(bound: usize, f: impl FnOnce() -> R) -> R {
     HITS.with(|hits| {
         let budget = hits.get();
         // with_bound cannot _increase_ the remaining budget
@@ -193,10 +199,11 @@ where
 
 /// Returns `Poll::Pending` if the current task has exceeded its budget and should yield.
 #[allow(unreachable_pub, dead_code)]
+#[inline]
 pub fn poll_proceed(cx: &mut Context<'_>) -> Poll<()> {
     HITS.with(|hits| {
         let n = hits.get();
-        if n == usize::max_value() {
+        if n == UNCONSTRAINED {
             // opted out of budgeting
             Poll::Ready(())
         } else if n == 0 {
@@ -224,6 +231,7 @@ pub fn poll_proceed(cx: &mut Context<'_>) -> Poll<()> {
 /// }
 /// ```
 #[allow(unreachable_pub, dead_code)]
+#[inline]
 pub async fn proceed() {
     use crate::future::poll_fn;
     poll_fn(|cx| poll_proceed(cx)).await;
@@ -241,9 +249,9 @@ mod test {
     fn bugeting() {
         use tokio_test::*;
 
-        assert_eq!(get(), usize::max_value());
+        assert_eq!(get(), UNCONSTRAINED);
         assert_ready!(task::spawn(()).enter(|cx, _| poll_proceed(cx)));
-        assert_eq!(get(), usize::max_value());
+        assert_eq!(get(), UNCONSTRAINED);
         opt_in();
         assert_eq!(get(), BUDGET);
         opt_in();
